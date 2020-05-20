@@ -1,0 +1,166 @@
+/****** Object:  StoredProcedure [EA].[usp_Dialer_Score_FY19]    Script Date: 7/3/2019 1:59:03 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+ALTER PROCEDURE  [EA].[usp_Dialer_Score_FY19] 
+AS
+SET NOCOUNT ON 
+BEGIN
+
+
+/*---------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------
+Author:			Bjorn Johnson
+Create Date:	1/25/2019
+
+-----------------------------------------------------------------------------------
+---------------------------------------------------------------------------------*/
+
+
+/*************************************************************
+
+ Creates table of every contact IDs Dialer activity in FY19
+ and their Sitecore Model Score & metrics
+
+**************************************************************/
+
+TRUNCATE TABLE  [EA].[USP_BJ_DIALER_MODEL_SCORE_TABLE_STG];
+
+with x
+as
+(
+select		    right(a.address1, charindex('-', reverse(a.address1)) - 1) as CONTACT_ID, --will have to specify "where address1 like '%-%' due to weird mail_id's
+				datediff(day,a.entry_date,getdate()) as DAYS_SINCE_LEAD_CREATION,
+				case when a.title = 'S' then 'STUDENT' when a.title = 'P' then 'PARENT' else 'OTHER' end as LEAD_TITLE,
+				a.address2 as LEAD_PROGRAM,--could be leads for multiple programs, so will have to de-dupe
+				datediff(day,a.last_local_call_time,getdate()) as DAYS_SINCE_LAST_CALL,--starting universe will have to specify 'WHERE A.LAST_LOCAL_CALL_TIME < '2018-11-01'
+				a.called_count as CALL_SEQUENCE,
+				--Outbound Variables:
+				case when b.comments in('MANUAL','AUTO') then 1 else 0 end as OB_CONNECTS,
+				case when b.comments = 'MANUAL' then b.length_in_sec when b.comments = 'AUTO' then (cast(b.length_in_sec as bigint)+13) end as LENGTH_OF_OB_CALL,
+				datediff(day,b.call_date,getdate()) as DAYS_SINCE_LAST_OB_CALL,
+				case when b.status = 'CALLBK' then 1 else 0 end as OB_CALL_BACKS,
+				case when b.status = 'PU' then 1 else 0 end as OB_PICK_UPS,
+				case when b.status in('NA','ADC','AB','DROP','ADCT','AL','AA','PDROP','A','B','AM') then 1 else 0 end as OB_NOT_ANSWERED,
+				case when b.status in('NI','DNC') then 1 else 0 end as OB_NOT_INTERESTED,
+				--Inbound Variables:
+				c.queue_seconds as INBOUND_TIME_QUEUE,
+				c.length_in_sec as INBOUND_CALL_LENGTH,
+				case when c.user_group in('Vienna','ViennaTiger') then 1 else 0 end as INBOUND_VIENNA,
+				c.queue_position as INBOUND_QUEUE_POSITION,--could be duplicates, partition by max?
+				datediff(day,c.call_date,getdate()) as DAYS_SINCE_INBOUND_CALL,
+				case when c.status = 'CALLBK' then 1 else 0 end as INBOUND_CALL_BACK,
+				case when c.status = 'PU' then 1 else 0 end as INBOUND_PICK_UP,
+				case when c.status in('NI','DNC') then 1 else 0 end as INBOUND_DND,
+				case when c.status in('AFTHRS','DROP','NA','NANQUE','A') then 1 else 0 end as INBOUND_NO_CONNECT,
+				case when c.term_reason in('AFTERHOURS','NOAGENT','HOLDTIME','ABANDON','QUEUETIMEOUT') then 1 else 0 end as INBOUND_BAD_SERVICE
+from vicidial.vicidial_list a(NOLOCK)
+left join vicidial.vicidial_log b(NOLOCK) on b.lead_id=a.lead_id
+left join vicidial.vicidial_closer_log c(NOLOCK) on c.lead_id=a.lead_id
+where a.address1 like '%-%'
+),
+y as
+(
+select		    CONTACT_ID,
+				row_number()over(partition by CONTACT_ID order by LEAD_PROGRAM desc) as contact_dedupe,
+				DAYS_SINCE_LEAD_CREATION,
+				LEAD_TITLE,
+				LEAD_PROGRAM,
+				DAYS_SINCE_LAST_CALL,
+				MAX(CALL_SEQUENCE) AS MAX_SEQUENCE,
+				SUM(OB_CONNECTS) AS TOTAL_OB_CONNECTS,
+				SUM(LENGTH_OF_OB_CALL) AS TOTAL_OB_CALL_LENGTH,
+				AVG(LENGTH_OF_OB_CALL) AS AVG_OB_CALL_LENGTH,
+				DAYS_SINCE_LAST_OB_CALL,
+				SUM(OB_CALL_BACKS) AS TOTAL_OB_CALL_BACKS,
+				SUM(OB_PICK_UPS) AS TOTAL_OB_PICK_UPS,
+				SUM(OB_NOT_ANSWERED) AS TOTAL_OB_NOT_ANSWERED,
+				SUM(OB_NOT_INTERESTED) AS TOTAL_OB_NOT_INTERESTED,
+				SUM(INBOUND_TIME_QUEUE) AS TOTAL_INBOUND_TIME_QUEUE,
+				SUM(INBOUND_CALL_LENGTH) AS TOTAL_INBOUND_CALL_LENGTH,
+				AVG(INBOUND_CALL_LENGTH) AS AVG_INBOUND_CALL_LENGTH,
+				SUM(INBOUND_VIENNA) AS TOTAL_INBOUND_VIENNA,
+				MAX(INBOUND_QUEUE_POSITION) AS MAX_INBOUND_QUEUE_POSITITION,
+				DAYS_SINCE_INBOUND_CALL,
+				SUM(INBOUND_CALL_BACK) AS TOTAL_INBOUND_CALL_BACK,
+				SUM(INBOUND_PICK_UP) AS TOTAL_INBOUND_PICK_UP,
+				SUM(INBOUND_DND) AS TOTAL_INBOUND_DND,
+				SUM(INBOUND_NO_CONNECT) AS TOTAL_INBOUND_NO_CONNECT,
+				SUM(INBOUND_BAD_SERVICE) AS TOTAL_INBOUND_BAD_SERVCE
+from x
+where isnumeric(CONTACT_ID)=1 and left(CONTACT_ID,1) <> '0'
+group by CONTACT_ID,DAYS_SINCE_LEAD_CREATION,LEAD_TITLE,LEAD_PROGRAM,DAYS_SINCE_LAST_CALL,DAYS_SINCE_LAST_OB_CALL,DAYS_SINCE_INBOUND_CALL
+),
+z as
+(
+select		    y.CONTACT_ID,
+			    y.DAYS_SINCE_LEAD_CREATION,
+				y.TOTAL_OB_CONNECTS,
+				y.TOTAL_OB_CALL_BACKS,
+				y.TOTAL_OB_NOT_INTERESTED,
+				y.TOTAL_INBOUND_CALL_LENGTH,
+			    y.TOTAL_INBOUND_VIENNA,
+				y.TOTAL_INBOUND_DND,
+				case when y.LEAD_PROGRAM in('PAT','JNL','EXS','JAB','AXS','APG') then 1 else 0 end as ELEM_MS_PROGRAM
+from y
+where contact_dedupe='1'-- and (TOTAL_OB_CALL_LENGTH is not null or TOTAL_INBOUND_CALL_LENGTH is not null)
+),
+zz as
+(
+select			z.CONTACT_ID,
+				z.DAYS_SINCE_LEAD_CREATION,
+				z.TOTAL_OB_CONNECTS,
+				z.TOTAL_OB_CALL_BACKS,
+				z.TOTAL_OB_NOT_INTERESTED,
+				z.TOTAL_INBOUND_CALL_LENGTH,
+				z.TOTAL_INBOUND_VIENNA,
+				z.TOTAL_INBOUND_DND,
+				z.ELEM_MS_PROGRAM,
+				(-2.8166 + (-0.0118 * z.DAYS_SINCE_LEAD_CREATION) + (-0.4936 * z.TOTAL_OB_CONNECTS) + (0.1975 * z.TOTAL_OB_CALL_BACKS) + (-0.6143 * z.TOTAL_OB_NOT_INTERESTED) +
+				(0.0011 * isnull(Z.TOTAL_INBOUND_CALL_LENGTH,0)) + (0.2637 * z.TOTAL_INBOUND_VIENNA) + (-0.7610 * TOTAL_INBOUND_DND) + (0.9424 * Z.ELEM_MS_PROGRAM)) as LOGIT
+from z
+)
+INSERT INTO EA.USP_BJ_DIALER_MODEL_SCORE_TABLE_STG(CONTACT_ID,DAYS_SINCE_LEAD_CREATION,TOTAL_OB_CONNECTS,TOTAL_OB_CALL_BACKS,TOTAL_OB_NOT_INTERESTED,TOTAL_INBOUND_CALL_LENGTH,TOTAL_INBOUND_VIENNA,TOTAL_INBOUND_DND,ELEM_MS_PROGRAM,LOGIT,PROBABILITY_SCORE)
+select			zz.CONTACT_ID,
+				zz.DAYS_SINCE_LEAD_CREATION,
+				zz.TOTAL_OB_CONNECTS,
+				zz.TOTAL_OB_CALL_BACKS,
+				zz.TOTAL_OB_NOT_INTERESTED,
+				zz.TOTAL_INBOUND_CALL_LENGTH,
+				zz.TOTAL_INBOUND_VIENNA,
+				zz.TOTAL_INBOUND_DND,
+				zz.ELEM_MS_PROGRAM,
+				zz.LOGIT,
+				exp(zz.LOGIT)/(1+exp(zz.LOGIT)) as PROBABILITY_SCORE
+from zz
+order by exp(zz.LOGIT)/(1+exp(zz.LOGIT)) desc
+
+--STG to PROD Upsert Operation:
+
+UPDATE P
+SET P.DAYS_SINCE_LEAD_CREATION=S.DAYS_SINCE_LEAD_CREATION,
+	P.TOTAL_OB_CONNECTS=S.TOTAL_OB_CONNECTS,
+	P.TOTAL_OB_CALL_BACKS=S.TOTAL_OB_CALL_BACKS,
+	P.TOTAL_OB_NOT_INTERESTED=S.TOTAL_OB_NOT_INTERESTED,
+	P.TOTAL_INBOUND_CALL_LENGTH=S.TOTAL_INBOUND_CALL_LENGTH,
+	P.TOTAL_INBOUND_VIENNA=S.TOTAL_INBOUND_VIENNA,
+	P.TOTAL_INBOUND_DND=S.TOTAL_INBOUND_DND,
+	P.ELEM_MS_PROGRAM=S.ELEM_MS_PROGRAM,
+	P.LOGIT=S.LOGIT,
+	P.PROBABILITY_SCORE=S.PROBABILITY_SCORE,
+	P.UPDATED_ON=GETDATE(),
+	P.EXTRACTED=0
+FROM EA.USP_BJ_DIALER_MODEL_SCORE_TABLE P, EA.USP_BJ_DIALER_MODEL_SCORE_TABLE_STG S
+WHERE P.CONTACT_ID=S.CONTACT_ID
+AND P.PROBABILITY_SCORE!=S.PROBABILITY_SCORE
+
+INSERT INTO EA.USP_BJ_DIALER_MODEL_SCORE_TABLE(CONTACT_ID,DAYS_SINCE_LEAD_CREATION,TOTAL_OB_CONNECTS,TOTAL_OB_CALL_BACKS,TOTAL_OB_NOT_INTERESTED,TOTAL_INBOUND_CALL_LENGTH,TOTAL_INBOUND_VIENNA,TOTAL_INBOUND_DND,ELEM_MS_PROGRAM,LOGIT,PROBABILITY_SCORE,ADDED_ON,UPDATED_ON,EXTRACTED)
+SELECT CONTACT_ID,DAYS_SINCE_LEAD_CREATION,TOTAL_OB_CONNECTS,TOTAL_OB_CALL_BACKS,TOTAL_OB_NOT_INTERESTED,TOTAL_INBOUND_CALL_LENGTH,TOTAL_INBOUND_VIENNA,TOTAL_INBOUND_DND,ELEM_MS_PROGRAM,LOGIT,PROBABILITY_SCORE,GETDATE(),GETDATE(),0 
+FROM EA.USP_BJ_DIALER_MODEL_SCORE_TABLE_STG S
+WHERE NOT EXISTS (SELECT 1 FROM EA.USP_BJ_DIALER_MODEL_SCORE_TABLE P WHERE P.CONTACT_ID=S.CONTACT_ID)
+
+--6:21
+
+END
